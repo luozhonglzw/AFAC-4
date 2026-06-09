@@ -20,6 +20,28 @@ RE_HIGH_VALUE = re.compile(
 # 表格行：以 | 开头
 RE_TABLE_ROW = re.compile(r"^\|.+\|$")
 
+# 研报领域：需要删除的低价值模式
+RE_RESEARCH_NOISE = re.compile(
+    r"(?:数据来源[：:].*)"
+    r"|(?:免责声明.*)"
+    r"|(?:风险提示.*)"
+    r"|(?:投资评级说明.*)"
+    r"|(?:分析师声明.*)"
+    r"|(?:图表\d+[：:].*)"
+    r"|(?:图\s*\d+[：:].*)"
+    r"|(?:表\s*\d+[：:].*)"
+    r"|(?:资料来源[：:].*)"
+    r"|(?:注[：:].*数据来自.*)"
+)
+
+# 财报领域：低价值章节标题
+RE_REPORT_NOISE_SECTION = re.compile(
+    r"(?:公司治理|股东情况|董事|监事|高级管理人员|员工情况|内部控制)"
+)
+
+# 研报摘要检测
+RE_RESEARCH_ABSTRACT = re.compile(r"(?:摘要|核心观点|投资要点|主要结论|关键发现)")
+
 
 # ====================================================================
 #  ChunkCompressor：规则驱动的 chunk 压缩
@@ -28,17 +50,25 @@ RE_TABLE_ROW = re.compile(r"^\|.+\|$")
 class ChunkCompressor:
     """
     基于规则压缩单个 chunk，不调用模型。
+    支持领域特定压缩：research、financial_reports 有专门的噪声过滤。
     """
 
     def __init__(self, relevance_threshold: float = 0.0,
-                 keep_high_value: bool = True):
+                 keep_high_value: bool = True,
+                 domain: str = ""):
         """
         Args:
             relevance_threshold: 关键词匹配度低于此值的句子被删除（0=保留全部）
             keep_high_value: 是否强制保留含数字/条款号的高信息量句子
+            domain: 领域标识，用于启用领域特定压缩
         """
         self.relevance_threshold = relevance_threshold
         self.keep_high_value = keep_high_value
+        self.domain = domain
+
+    def set_domain(self, domain: str):
+        """设置当前领域"""
+        self.domain = domain
 
     def compress(self, chunk: dict, query: str = "") -> dict:
         """
@@ -58,6 +88,12 @@ class ChunkCompressor:
             compressed_text = self._compress_table(text)
         else:
             compressed_text = self._compress_text(text, query)
+
+        # 领域特定压缩后处理
+        if self.domain == "research":
+            compressed_text = self._compress_research(compressed_text, query)
+        elif self.domain == "financial_reports":
+            compressed_text = self._compress_financial_report(compressed_text, query)
 
         return {
             **chunk,
@@ -144,6 +180,95 @@ class ChunkCompressor:
     def _extract_keywords(text: str) -> set[str]:
         """简单关键词提取（2字以上连续中文）"""
         return {m for m in re.findall(r"[一-鿿]{2,}", text)}
+
+    # ---------- 领域特定压缩 ----------
+
+    def _compress_research(self, text: str, query: str) -> str:
+        """
+        研究报告领域压缩：
+        - 删除数据来源脚注、免责声明、风险提示
+        - 删除图表描述（保留标题）
+        - 优先保留摘要段落
+        - 只保留与问题相关的段落
+        """
+        if not text:
+            return text
+
+        lines = text.split("\n")
+        kept = []
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            # 删除低价值噪声行
+            if RE_RESEARCH_NOISE.search(stripped):
+                continue
+
+            # 保留摘要段落（高优先级）
+            if RE_RESEARCH_ABSTRACT.search(stripped):
+                kept.append(stripped)
+                continue
+
+            # 保留高信息量句子
+            if RE_HIGH_VALUE.search(stripped):
+                kept.append(stripped)
+                continue
+
+            # 保留与问题相关的句子
+            if query:
+                query_chars = set(re.findall(r"[一-鿿]{2,}", query))
+                if any(kw in stripped for kw in query_chars):
+                    kept.append(stripped)
+                    continue
+
+            # 其他行保留（但缩短）
+            if len(stripped) > 200:
+                kept.append(stripped[:200] + "...")
+            else:
+                kept.append(stripped)
+
+        return "\n".join(kept) if kept else text[:300]
+
+    def _compress_financial_report(self, text: str, query: str) -> str:
+        """
+        财务报告领域压缩：
+        - 删除公司治理、股东情况等非财务章节
+        - 表格只保留与问题年份相关的行
+        - 保留关键财务指标
+        """
+        if not text:
+            return text
+
+        lines = text.split("\n")
+        kept = []
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            # 删除非财务相关章节
+            if RE_REPORT_NOISE_SECTION.search(stripped) and len(stripped) < 30:
+                continue
+
+            # 保留高信息量句子（财务数据）
+            if RE_HIGH_VALUE.search(stripped):
+                kept.append(stripped)
+                continue
+
+            # 保留与问题相关的句子
+            if query:
+                query_chars = set(re.findall(r"[一-鿿]{2,}", query))
+                if any(kw in stripped for kw in query_chars):
+                    kept.append(stripped)
+                    continue
+
+            # 其他行保留
+            kept.append(stripped)
+
+        return "\n".join(kept) if kept else text[:300]
 
 
 # ====================================================================
@@ -360,7 +485,8 @@ class ContextBuilder:
                 "然后给出最终答案。\n"
                 "最终答案必须严格为以下 JSON 格式：\n"
                 '{"reasoning": "分析过程", "answer": "A"}\n'
-                "其中 answer 只能是 A/B/C/D 中的一个字母。"
+                "其中 answer 只能是 A/B/C/D 中的一个字母。\n"
+                "重要：单选题只能输出一个字母，不能输出多个。"
             )
         elif answer_format == "multi":
             return (
@@ -368,7 +494,9 @@ class ContextBuilder:
                 "然后给出所有正确选项。\n"
                 "最终答案必须严格为以下 JSON 格式：\n"
                 '{"reasoning": "分析过程", "answer": ["A", "C"]}\n'
-                "其中 answer 为正确选项字母列表，可包含多个。"
+                "其中 answer 为正确选项字母列表。\n"
+                "重要：多选题答案只能包含 A/B/C/D 四个字母的组合，不能出现 E/F/G 等其他字母。\n"
+                "单选题和判断题只能输出一个字母。"
             )
         elif answer_format == "tf":
             return (
@@ -376,7 +504,8 @@ class ContextBuilder:
                 "然后给出最终判断。\n"
                 "最终答案必须严格为以下 JSON 格式：\n"
                 '{"reasoning": "分析过程", "answer": "A"}\n'
-                "其中 A 表示正确，B 表示错误。"
+                "其中 A 表示正确，B 表示错误。\n"
+                "重要：判断题只能输出 A 或 B，不能输出其他字母。"
             )
         else:
             return '请输出 JSON 格式：{"reasoning": "分析过程", "answer": "..."}'

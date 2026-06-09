@@ -55,10 +55,11 @@ prompt_tokens_used = 0           # 已用 prompt tokens（运行时累加）
 completion_tokens_used = 0       # 已用 completion tokens（运行时累加）
 
 # ==================== 并发与重试 ====================
-MAX_CONCURRENCY = 8              # 最大并发请求数（5-10，避免限流）
-MAX_RETRIES = 3                  # 单次请求最大重试次数
-RETRY_BASE_DELAY = 1.0           # 重试基础间隔（秒），指数退避
-REQUEST_TIMEOUT = 60             # 单次请求超时（秒）
+MAX_CONCURRENCY = 3              # 最大并发请求数（降低并发减少限流）
+MAX_RETRIES = 5                  # 单次请求最大重试次数
+RETRY_BASE_DELAY = 5.0           # 重试基础间隔（秒），指数退避
+REQUEST_TIMEOUT = 180            # 单次请求超时（秒），大context需要3分钟
+RETRY_BACKOFF = [5, 10, 20, 40, 80]  # 指数退避序列（秒）
 
 # ==================== 检索配置 ====================
 BM25_K1 = 1.5
@@ -123,8 +124,8 @@ QUESTION_TYPES = {
     },
     "multi": {
         "label": "多选题",
-        "valid_answers": {"A", "B", "C", "D", "E"},
-        "format_rule": "按字母升序拼接，无分隔符，如 ABC",
+        "valid_answers": {"A", "B", "C", "D"},  # 严格限制 A-D，不允许 E
+        "format_rule": "按字母升序拼接，无分隔符，如 ABC（最多4个字母）",
     },
     "tf": {
         "label": "判断题",

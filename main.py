@@ -10,6 +10,7 @@ AFAC2026-4 金融文档智能问答系统 - 主入口
     python main.py --skip-index             # 跳过索引构建（已有 index 数据）
     python main.py --domain insurance       # 只处理单个领域
     python main.py --limit 5 --debug        # 调试模式，详细日志
+    python main.py --resume                 # 从断点续跑
 """
 import argparse
 import json
@@ -97,6 +98,10 @@ def parse_args():
     parser.add_argument(
         "--debug", action="store_true",
         help="调试模式：输出每题的检索/压缩/推理详情",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="从断点续跑（跳过已完成的题目）",
     )
     return parser.parse_args()
 
@@ -230,6 +235,49 @@ def step_load_questions(split: str, domain_filter: str = None) -> list[dict]:
 
 # ==================== 步骤 4：批量解题 ====================
 
+# 断点续跑：checkpoint 文件路径
+CHECKPOINT_FILE = PROJECT_ROOT / "output" / "checkpoint.json"
+
+def _load_checkpoint() -> set[str]:
+    """加载已完成的 qid 集合"""
+    if CHECKPOINT_FILE.exists():
+        try:
+            with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return set(data.get("completed_qids", []))
+        except Exception:
+            pass
+    return set()
+
+def _save_checkpoint(completed_qids: set[str]):
+    """保存已完成的 qid 集合"""
+    CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+        json.dump({"completed_qids": sorted(completed_qids)}, f, ensure_ascii=False, indent=2)
+
+def _check_budget_warning(agent: FinancialAgent, question_idx: int, total_questions: int):
+    """检查预算状态并输出警告"""
+    stats = agent.get_stats()
+    status = stats["budget_status"]
+    remaining = stats["remaining_budget"]
+    ratio = remaining / agent.memory.token_budget if agent.memory.token_budget > 0 else 0
+
+    if status == "exhausted":
+        logger.error(f"Token 预算已耗尽！剩余: {remaining:,}")
+        return "exhausted"
+    elif status == "critical":
+        logger.warning(f"Token 预算严重不足！剩余: {remaining:,} ({ratio:.1%})")
+        return "critical"
+    elif status == "warn":
+        logger.warning(f"Token 预算不足预警：剩余: {remaining:,} ({ratio:.1%})")
+        return "warn"
+
+    # 每10题输出一次状态
+    if question_idx > 0 and question_idx % 10 == 0:
+        logger.info(f"预算状态 [{question_idx}/{total_questions}]: 剩余 {remaining:,} ({ratio:.1%})")
+
+    return "normal"
+
 def step_solve(
     questions: list[dict],
     ki: KeywordIndex,
@@ -238,19 +286,56 @@ def step_solve(
     max_workers: int,
     budget_limit: int,
     debug: bool = False,
+    resume: bool = False,
 ) -> list[dict]:
-    """批量解题"""
+    """批量解题，支持断点续跑和预算预警"""
     logger.info("=" * 50)
     logger.info(f"步骤 4：批量解题（{max_workers} 并发，预算 {budget_limit:,}）")
     logger.info("=" * 50)
 
     agent = FinancialAgent(ki, ri, si, token_budget=budget_limit)
 
+    # 断点续跑：跳过已完成的题目
+    completed_qids = set()
+    if resume:
+        completed_qids = _load_checkpoint()
+        if completed_qids:
+            logger.info(f"断点续跑：跳过 {len(completed_qids)} 个已完成题目")
+
     # debug 模式：逐题串行，打印详情
     if debug:
         results = []
         for i, q in enumerate(questions):
             qid = q.get("qid", f"q{i}")
+
+            # 断点续跑：跳过已完成
+            if resume and qid in completed_qids:
+                logger.info(f"[{i+1}/{len(questions)}] {qid} (已完成，跳过)")
+                results.append({
+                    "qid": qid,
+                    "answer": "",
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "evidence": [],
+                    "skipped": True,
+                })
+                continue
+
+            # 预算检查
+            budget_status = _check_budget_warning(agent, i, len(questions))
+            if budget_status == "exhausted":
+                logger.error(f"预算耗尽，第 {i} 题起跳过")
+                results.append({
+                    "qid": qid,
+                    "answer": "A",
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "evidence": [],
+                })
+                continue
+
             logger.info(f"\n{'='*60}")
             logger.info(f"[{i+1}/{len(questions)}] {qid} ({q.get('domain','')})")
             logger.info(f"  题型: {q.get('answer_format','')}")
@@ -266,11 +351,25 @@ def step_solve(
             if result.get("raw_model_output"):
                 logger.info(f"  模型原始输出: {result['raw_model_output'][:200]}...")
             results.append(result)
+
+            # 保存断点
+            completed_qids.add(qid)
+            _save_checkpoint(completed_qids)
+
+            # 请求间隔（减少限流）
+            if i < len(questions) - 1:
+                time.sleep(0.5)
     else:
         t0 = time.time()
         results = agent.batch_solve(questions, max_workers=max_workers)
         elapsed = time.time() - t0
         logger.info(f"解题耗时 {elapsed:.1f}s")
+
+        # 保存断点
+        for r in results:
+            if r and r.get("qid"):
+                completed_qids.add(r["qid"])
+        _save_checkpoint(completed_qids)
 
     stats = agent.get_stats()
     logger.info(f"解题完成: {len(results)} 题")
@@ -349,7 +448,7 @@ def main():
         logger.info(f"  截断为前 {limit} 题")
 
     # 步骤 4：批量解题
-    results = step_solve(questions, ki, ri, si, max_workers, budget_limit, debug=debug)
+    results = step_solve(questions, ki, ri, si, max_workers, budget_limit, debug=debug, resume=args.resume)
 
     # 步骤 5：生成提交文件
     logger.info("=" * 50)

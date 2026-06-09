@@ -1,6 +1,7 @@
 """
 金融长文本问答 Agent
 仅使用 Qwen3.6-plus，所有推理必须基于文档证据
+支持超时降级、断点续跑、额度预警
 """
 import json
 import re
@@ -15,7 +16,7 @@ from openai import OpenAI
 from .config import (
     API_KEY, QWEN_MODEL, QWEN_BASE_URL,
     MAX_TOKENS, TEMPERATURE, TOP_P,
-    MAX_RETRIES, RETRY_BASE_DELAY, REQUEST_TIMEOUT, MAX_CONCURRENCY,
+    MAX_RETRIES, RETRY_BACKOFF, REQUEST_TIMEOUT, MAX_CONCURRENCY,
     TOTAL_TOKEN_BUDGET,
 )
 from .indexer import KeywordIndex, RuleIndex, SectionIndex, search
@@ -25,6 +26,10 @@ from .compressor import (
 from .answer_formatter import normalize_answer, validate_answer, extract_json_answer
 
 logger = logging.getLogger(__name__)
+
+# 断点续跑：checkpoint 文件路径
+CHECKPOINT_FILE = Path(__file__).parent.parent / "output" / "checkpoint.json"
+FAILED_QUESTIONS_FILE = Path(__file__).parent.parent / "output" / "failed_questions.json"
 
 
 class FinancialAgent:
@@ -66,6 +71,7 @@ class FinancialAgent:
     def solve(self, question_item: dict) -> dict:
         """
         处理单道题目，返回结果 dict。
+        支持超时降级：Top5 -> Top3 -> Top1 -> 空
 
         Args:
             question_item: {
@@ -91,7 +97,8 @@ class FinancialAgent:
         raw_chunks = self._retrieve(question, domain, doc_ids)
         retrieval_count = len(raw_chunks)
 
-        # 2. 压缩
+        # 2. 压缩（设置领域）
+        self.compressor.set_domain(domain)
         evidence_chunks = self._compress(raw_chunks, question)
         compressed_len = sum(len(c.get("text", "")) for c in evidence_chunks)
 
@@ -101,8 +108,8 @@ class FinancialAgent:
             if cn:
                 self.memory.record_clause(cn, c.get("text", "")[:200])
 
-        # 4. 推理
-        raw_answer, usage = self._reason(
+        # 4. 推理（带超时降级）
+        raw_answer, usage = self._reason_with_fallback(
             question, options, evidence_chunks, domain, answer_format,
         )
 
@@ -195,10 +202,10 @@ class FinancialAgent:
         return aggregated
 
     # ====================================================================
-    #  推理阶段
+    #  推理阶段（带超时降级）
     # ====================================================================
 
-    def _reason(
+    def _reason_with_fallback(
         self,
         question: str,
         options: Optional[dict[str, str]],
@@ -207,14 +214,65 @@ class FinancialAgent:
         answer_format: str,
     ) -> tuple[str, dict]:
         """
-        调用 Qwen3.6-plus 进行推理。
-        Returns: (raw_answer, usage_dict)
+        超时降级策略：
+        Level 0: 正常 context（所有 chunks）
+        Level 1: Top 3 chunks，缩短 prompt
+        Level 2: Top 1 chunk + 题目摘要
+        Level 3: 全部失败，返回空
+        """
+        # Level 0: 正常调用
+        raw_answer, usage = self._try_reason(
+            question, options, evidence_chunks, domain, answer_format, level=0
+        )
+        if raw_answer:
+            return raw_answer, usage
+
+        # Level 1: Top 3 chunks
+        if len(evidence_chunks) > 3:
+            logger.info(f"降级 Level 1: Top 3 chunks (原 {len(evidence_chunks)} 个)")
+            top3 = evidence_chunks[:3]
+            raw_answer, usage = self._try_reason(
+                question, options, top3, domain, answer_format, level=1
+            )
+            if raw_answer:
+                return raw_answer, usage
+
+        # Level 2: Top 1 chunk
+        if len(evidence_chunks) > 1:
+            logger.info(f"降级 Level 2: Top 1 chunk")
+            top1 = evidence_chunks[:1]
+            raw_answer, usage = self._try_reason(
+                question, options, top1, domain, answer_format, level=2
+            )
+            if raw_answer:
+                return raw_answer, usage
+
+        # Level 3: 全部失败
+        logger.error(f"所有降级级别失败，返回空答案")
+        self._record_failed(question, domain, "all_levels_failed")
+        return "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    def _try_reason(
+        self,
+        question: str,
+        options: Optional[dict[str, str]],
+        evidence_chunks: list[dict],
+        domain: str,
+        answer_format: str,
+        level: int = 0,
+    ) -> tuple[str, dict]:
+        """
+        尝试单次推理调用。
+        level > 0 时增加 temperature 以提高灵活性。
         """
         messages = self.context_builder.build_messages(
             question, options, evidence_chunks, domain, answer_format,
         )
 
-        raw_answer, usage = self._call_model(messages)
+        # 降级时增加 temperature
+        temp = TEMPERATURE + level * 0.05
+
+        raw_answer, usage = self._call_model(messages, temperature=temp)
         return raw_answer, usage
 
     def _call_model(
@@ -224,6 +282,7 @@ class FinancialAgent:
     ) -> tuple[str, dict]:
         """
         调用 Qwen3.6-plus，含重试、退避、Token 计数。
+        使用 RETRY_BACKOFF 序列进行退避。
 
         Returns: (answer_text, {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int})
         """
@@ -254,13 +313,36 @@ class FinancialAgent:
 
             except Exception as e:
                 last_error = e
-                wait = RETRY_BASE_DELAY * (2 ** attempt)
+                # 使用预定义的退避序列
+                if attempt < len(RETRY_BACKOFF):
+                    wait = RETRY_BACKOFF[attempt]
+                else:
+                    wait = RETRY_BACKOFF[-1] * (2 ** (attempt - len(RETRY_BACKOFF) + 1))
                 logger.warning(f"模型调用失败 (attempt {attempt+1}/{MAX_RETRIES}): {e}, 等待 {wait}s")
                 time.sleep(wait)
 
         # 全部重试失败
         logger.error(f"模型调用最终失败: {last_error}")
         return "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    def _record_failed(self, question: str, domain: str, reason: str):
+        """记录失败题目到 failed_questions.json"""
+        try:
+            FAILED_QUESTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            failed = []
+            if FAILED_QUESTIONS_FILE.exists():
+                with open(FAILED_QUESTIONS_FILE, "r", encoding="utf-8") as f:
+                    failed = json.load(f)
+            failed.append({
+                "question": question[:100],
+                "domain": domain,
+                "reason": reason,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            with open(FAILED_QUESTIONS_FILE, "w", encoding="utf-8") as f:
+                json.dump(failed, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"记录失败题目时出错: {e}")
 
     # ====================================================================
     #  后处理
