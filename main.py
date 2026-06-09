@@ -3,12 +3,13 @@ AFAC2026-4 金融文档智能问答系统 - 主入口
 
 用法:
     python main.py                          # 处理全部 A 榜题目
-    python main.py --split A                # 指定 A/B 榜
+    python main.py --split A --limit 5      # 只跑前5题（调试）
     python main.py --split B --workers 10   # B 榜，10 并发
     python main.py --budget-limit 4000000   # 自定义 Token 预算
     python main.py --skip-parse             # 跳过文档解析（已有 processed 数据）
     python main.py --skip-index             # 跳过索引构建（已有 index 数据）
     python main.py --domain insurance       # 只处理单个领域
+    python main.py --limit 5 --debug        # 调试模式，详细日志
 """
 import argparse
 import json
@@ -75,6 +76,14 @@ def parse_args():
     parser.add_argument(
         "--output-dir", type=str, default=None,
         help="输出目录（默认项目根目录）",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=0,
+        help="只处理前 N 题（0=不限制，用于调试）",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="调试模式：输出每题的检索/压缩/推理详情",
     )
     return parser.parse_args()
 
@@ -215,6 +224,7 @@ def step_solve(
     si: SectionIndex,
     max_workers: int,
     budget_limit: int,
+    debug: bool = False,
 ) -> list[dict]:
     """批量解题"""
     logger.info("=" * 50)
@@ -223,12 +233,34 @@ def step_solve(
 
     agent = FinancialAgent(ki, ri, si, token_budget=budget_limit)
 
-    t0 = time.time()
-    results = agent.batch_solve(questions, max_workers=max_workers)
-    elapsed = time.time() - t0
+    # debug 模式：逐题串行，打印详情
+    if debug:
+        results = []
+        for i, q in enumerate(questions):
+            qid = q.get("qid", f"q{i}")
+            logger.info(f"\n{'='*60}")
+            logger.info(f"[{i+1}/{len(questions)}] {qid} ({q.get('domain','')})")
+            logger.info(f"  题型: {q.get('answer_format','')}")
+            logger.info(f"  题目: {q.get('question','')[:100]}...")
+
+            result = agent.solve(q)
+
+            logger.info(f"  检索候选: {result.get('retrieval_count', '?')} chunks")
+            logger.info(f"  压缩后:   {result.get('compressed_len', '?')} chars")
+            logger.info(f"  Prompt tokens:   {result.get('prompt_tokens', 0):,}")
+            logger.info(f"  Completion tokens: {result.get('completion_tokens', 0):,}")
+            logger.info(f"  答案: {result.get('answer', '')}")
+            if result.get("raw_model_output"):
+                logger.info(f"  模型原始输出: {result['raw_model_output'][:200]}...")
+            results.append(result)
+    else:
+        t0 = time.time()
+        results = agent.batch_solve(questions, max_workers=max_workers)
+        elapsed = time.time() - t0
+        logger.info(f"解题耗时 {elapsed:.1f}s")
 
     stats = agent.get_stats()
-    logger.info(f"解题完成: {len(results)} 题, 耗时 {elapsed:.1f}s")
+    logger.info(f"解题完成: {len(results)} 题")
     logger.info(f"Token 消耗: {stats['token_usage']}")
     logger.info(f"预算状态: {stats['budget_status']}")
 
@@ -245,11 +277,19 @@ def main():
     budget_limit = args.budget_limit
     output_dir = Path(args.output_dir) if args.output_dir else PROJECT_ROOT
 
+    limit = args.limit
+    debug = args.debug
+
+    if debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
     logger.info("AFAC2026-4 金融文档智能问答系统 启动")
     logger.info(f"  Split:    {split}")
     logger.info(f"  Domain:   {domain_filter or '全部'}")
     logger.info(f"  Workers:  {max_workers}")
     logger.info(f"  Budget:   {budget_limit:,}")
+    logger.info(f"  Limit:    {limit or '不限'}")
+    logger.info(f"  Debug:    {debug}")
     logger.info(f"  Output:   {output_dir}")
 
     t_start = time.time()
@@ -269,8 +309,13 @@ def main():
         logger.error("没有找到题目，退出")
         sys.exit(1)
 
+    # limit 截断
+    if limit > 0:
+        questions = questions[:limit]
+        logger.info(f"  截断为前 {limit} 题")
+
     # 步骤 4：批量解题
-    results = step_solve(questions, ki, ri, si, max_workers, budget_limit)
+    results = step_solve(questions, ki, ri, si, max_workers, budget_limit, debug=debug)
 
     # 步骤 5：生成提交文件
     logger.info("=" * 50)

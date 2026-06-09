@@ -88,10 +88,12 @@ class FinancialAgent:
         doc_ids = question_item.get("doc_ids")
 
         # 1. 检索
-        evidence_chunks = self._retrieve(question, domain, doc_ids)
+        raw_chunks = self._retrieve(question, domain, doc_ids)
+        retrieval_count = len(raw_chunks)
 
         # 2. 压缩
-        evidence_chunks = self._compress(evidence_chunks, question)
+        evidence_chunks = self._compress(raw_chunks, question)
+        compressed_len = sum(len(c.get("text", "")) for c in evidence_chunks)
 
         # 3. 记录高频法条
         for c in evidence_chunks:
@@ -117,6 +119,10 @@ class FinancialAgent:
             "completion_tokens": usage.get("completion_tokens", 0),
             "total_tokens": usage.get("total_tokens", 0),
             "evidence": evidence_list,
+            # 调试字段
+            "retrieval_count": retrieval_count,
+            "compressed_len": compressed_len,
+            "raw_model_output": raw_answer,
         }
 
     # ====================================================================
