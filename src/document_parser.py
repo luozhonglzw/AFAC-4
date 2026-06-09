@@ -324,6 +324,8 @@ def process_domain(domain: str) -> list[dict]:
     # PDF（含子目录）
     for pdf_path in sorted(raw_dir.rglob("*.pdf")):
         chunks = parse_pdf(pdf_path, domain=domain)
+        for c in chunks:
+            c["domain"] = domain
         all_chunks.extend(chunks)
         out_file = out_dir / f"{pdf_path.stem}.jsonl"
         save_processed(chunks, out_file)
@@ -331,6 +333,8 @@ def process_domain(domain: str) -> list[dict]:
     # TXT（含子目录）
     for txt_path in sorted(raw_dir.rglob("*.txt")):
         chunks = parse_txt(txt_path, domain=domain)
+        for c in chunks:
+            c["domain"] = domain
         all_chunks.extend(chunks)
         out_file = out_dir / f"{txt_path.stem}.jsonl"
         save_processed(chunks, out_file)

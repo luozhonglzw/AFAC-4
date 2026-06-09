@@ -139,15 +139,27 @@ class FinancialAgent:
         混合检索：KeywordIndex(BM25) + RuleIndex(领域关键词) + SectionIndex(条款号)
         A榜有 doc_ids 时限定范围，B榜全库检索。
         """
+        # 先按 domain 过滤索引中的 chunk
+        domain_chunks = [c for c in self.ki.chunks if c.get("domain") == domain]
+
         all_hits = search(question, domain, self.ki, self.ri, self.si, top_k=20)
+
+        # doc_id 标准化："text01" -> "1"
+        def _normalize_doc_id(did: str) -> str:
+            if did.startswith("text"):
+                return did[4:].lstrip("0") or "0"
+            return did
 
         # 如果有 doc_ids，优先保留指定文档的结果
         if doc_ids:
-            doc_set = set(doc_ids)
-            primary = [h for h in all_hits if h.get("doc_id") in doc_set]
-            secondary = [h for h in all_hits if h.get("doc_id") not in doc_set]
-            # 主文档结果优先，不足时补充
+            norm_ids = {_normalize_doc_id(d) for d in doc_ids}
+            primary = [h for h in all_hits if _normalize_doc_id(h.get("doc_id", "")) in norm_ids]
+            secondary = [h for h in all_hits if _normalize_doc_id(h.get("doc_id", "")) not in norm_ids]
             all_hits = primary + secondary
+
+        # 确保结果属于当前领域（兜底）
+        if not all_hits:
+            all_hits = domain_chunks[:10]
 
         return all_hits
 

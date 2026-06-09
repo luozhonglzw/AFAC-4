@@ -442,9 +442,19 @@ def search(
     4. 合并去重，按综合分排序
     """
     all_chunks = ki.chunks
+
+    # 领域过滤：只检索当前领域的 chunk
+    domain_indices = [i for i, c in enumerate(all_chunks) if c.get("domain") == domain]
+    if not domain_indices:
+        # 兜底：无领域标记时检索全部
+        domain_indices = list(range(len(all_chunks)))
+
+    domain_chunks_set = set(domain_indices)
     results: dict[int, dict] = {}  # idx -> {chunk..., final_score}
 
     def _merge(idx: int, extra_score: float, source: str):
+        if idx not in domain_chunks_set:
+            return  # 跳过非当前领域的 chunk
         if idx in results:
             results[idx]["final_score"] += extra_score
             results[idx]["sources"].add(source)
@@ -458,7 +468,6 @@ def search(
     # 1) 章节/条款精确匹配（最高权重）
     sec_hits = si.search(query, all_chunks)
     for hit in sec_hits:
-        # 在 all_chunks 中找到对应 idx
         for idx, c in enumerate(all_chunks):
             if c is hit:
                 _merge(idx, 10.0, "section")
