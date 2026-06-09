@@ -92,8 +92,8 @@ def parse_args():
         help="随机采样种子（默认 42）",
     )
     parser.add_argument(
-        "--blind-test", action="store_true",
-        help="盲测模式：删除 doc_ids，测试候选文档检索能力",
+        "--blind-test", "--blind", action="store_true",
+        help="盲测模式：B榜无 doc_ids，使用跨域检索",
     )
     parser.add_argument(
         "--debug", action="store_true",
@@ -296,16 +296,19 @@ def step_solve(
     debug: bool = False,
     resume: bool = False,
     checkpoint_file: Path = None,
+    blind: bool = False,
 ) -> list[dict]:
     """批量解题，支持断点续跑和预算预警"""
     if checkpoint_file is None:
         checkpoint_file = _DEFAULT_CHECKPOINT
 
+    mode = "盲测" if blind else "常规"
     logger.info("=" * 50)
-    logger.info(f"步骤 4：批量解题（{max_workers} 并发，预算 {budget_limit:,}）")
+    logger.info(f"步骤 4：批量解题（{mode}模式，{max_workers} 并发，预算 {budget_limit:,}）")
     logger.info("=" * 50)
 
     agent = FinancialAgent(ki, ri, si, token_budget=budget_limit)
+    solve_fn = agent.solve_blind if blind else agent.solve
 
     # 断点续跑：跳过已完成的题目
     completed_qids = set()
@@ -353,7 +356,7 @@ def step_solve(
             logger.info(f"  题型: {q.get('answer_format','')}")
             logger.info(f"  题目: {q.get('question','')[:100]}...")
 
-            result = agent.solve(q)
+            result = solve_fn(q)
 
             logger.info(f"  检索候选: {result.get('retrieval_count', '?')} chunks")
             logger.info(f"  压缩后:   {result.get('compressed_len', '?')} chars")
@@ -373,7 +376,7 @@ def step_solve(
                 time.sleep(0.5)
     else:
         t0 = time.time()
-        results = agent.batch_solve(questions, max_workers=max_workers)
+        results = agent.batch_solve(questions, max_workers=max_workers, blind=blind)
         elapsed = time.time() - t0
         logger.info(f"解题耗时 {elapsed:.1f}s")
 
@@ -462,7 +465,8 @@ def main():
     # 步骤 4：批量解题
     checkpoint_file = _get_checkpoint_file(output_dir)
     results = step_solve(questions, ki, ri, si, max_workers, budget_limit,
-                         debug=debug, resume=args.resume, checkpoint_file=checkpoint_file)
+                         debug=debug, resume=args.resume, checkpoint_file=checkpoint_file,
+                         blind=args.blind_test)
 
     # 步骤 5：生成提交文件
     logger.info("=" * 50)

@@ -17,7 +17,7 @@ from .config import (
     API_KEY, QWEN_MODEL, QWEN_BASE_URL,
     MAX_TOKENS, TEMPERATURE, TOP_P,
     MAX_RETRIES, RETRY_BACKOFF, REQUEST_TIMEOUT, MAX_CONCURRENCY,
-    TOTAL_TOKEN_BUDGET,
+    TOTAL_TOKEN_BUDGET, DOMAINS,
 )
 from .indexer import KeywordIndex, RuleIndex, SectionIndex, search
 from .compressor import (
@@ -169,6 +169,156 @@ class FinancialAgent:
             all_hits = domain_chunks[:10]
 
         return all_hits
+
+    # ====================================================================
+    #  B 榜盲测模式
+    # ====================================================================
+
+    def solve_blind(self, question_item: dict) -> dict:
+        """
+        B 榜模式：无 doc_ids，盲测检索候选文档。
+        流程：跨域粗排 -> doc_id 聚合 -> 领域推断 -> 精排 -> 推理
+        """
+        qid = question_item.get("qid", "")
+        domain_hint = question_item.get("domain", "")
+        question = question_item.get("question", "")
+        options = question_item.get("options")
+        answer_format = question_item.get("answer_format", "mcq")
+
+        # 1. 跨域粗排
+        raw_chunks, inferred_domain = self._retrieve_blind(question, domain_hint)
+
+        # 2. 压缩
+        self.compressor.set_domain(inferred_domain)
+        evidence_chunks = self._compress(raw_chunks, question)
+        compressed_len = sum(len(c.get("text", "")) for c in evidence_chunks)
+
+        # 3. 记录高频法条
+        for c in evidence_chunks:
+            cn = c.get("clause_number", "")
+            if cn:
+                self.memory.record_clause(cn, c.get("text", "")[:200])
+
+        # 4. 推理
+        raw_answer, usage = self._reason_with_fallback(
+            question, options, evidence_chunks, inferred_domain, answer_format,
+        )
+
+        # 5. 后处理
+        final_answer = self._post_process(raw_answer, answer_format)
+
+        # 6. 构建 evidence 列表
+        evidence_list = self.aggregator.build_evidence_list(evidence_chunks)
+
+        return {
+            "qid": qid,
+            "answer": final_answer,
+            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+            "evidence": evidence_list,
+            "retrieval_count": len(raw_chunks),
+            "compressed_len": compressed_len,
+            "raw_model_output": raw_answer,
+            "inferred_domain": inferred_domain,
+        }
+
+    def _retrieve_blind(self, question: str, domain_hint: str = "") -> tuple[list[dict], str]:
+        """
+        盲测检索：跨所有领域粗排 -> 全局 BM25 -> doc_id 聚合 -> 领域推断 -> 精排
+
+        Returns:
+            (chunks, inferred_domain)
+        """
+        all_domains = list(DOMAINS.keys())
+
+        # 步骤 1：跨域粗排，每个领域取 Top 5
+        all_candidates = []
+        for domain in all_domains:
+            try:
+                hits = search(question, domain, self.ki, self.ri, self.si, top_k=5)
+                for h in hits:
+                    h["_search_domain"] = domain
+                all_candidates.extend(hits)
+            except Exception:
+                continue
+
+        # 步骤 1b：全局 BM25 检索（不过滤领域）
+        global_hits = self.ki.search(question, top_k=15)
+        for h in global_hits:
+            h["_search_domain"] = h.get("domain", "")
+            all_candidates.append(h)
+
+        # 步骤 1c：实体匹配（题目中提到的文档名 -> doc_id）
+        doc_name_patterns = re.findall(r'(?:fc_text|fin_text|ins_text|reg_text|res_text)_(\d+)', question)
+        for num in doc_name_patterns:
+            doc_id = f"text{int(num):02d}"
+            matched = [c for c in self.ki.chunks if c.get("doc_id") == doc_id]
+            for h in matched[:10]:
+                h["_search_domain"] = h.get("domain", "")
+                h["score"] = 10.0
+                all_candidates.append(h)
+
+        if not all_candidates:
+            fallback = [c for c in self.ki.chunks if c.get("domain") == domain_hint][:10]
+            return fallback, domain_hint
+
+        # 步骤 2：按 doc_id 聚合分数
+        doc_scores: dict[str, dict] = {}
+        for cand in all_candidates:
+            doc_id = cand.get("doc_id", "unknown")
+            domain = cand.get("_search_domain", "")
+            score = cand.get("score", 0)
+            if doc_id not in doc_scores:
+                doc_scores[doc_id] = {"score": 0, "domain": domain, "count": 0}
+            doc_scores[doc_id]["score"] += score
+            doc_scores[doc_id]["count"] += 1
+
+        # 步骤 3：推断领域（按聚合分数投票）
+        domain_votes: dict[str, float] = {}
+        for doc_id, info in doc_scores.items():
+            d = info["domain"]
+            domain_votes[d] = domain_votes.get(d, 0) + info["score"]
+
+        # 如果有 domain_hint，加权
+        if domain_hint and domain_hint in domain_votes:
+            domain_votes[domain_hint] *= 1.5
+
+        inferred_domain = max(domain_votes, key=domain_votes.get) if domain_votes else domain_hint
+
+        # 步骤 4：取 Top 10 doc_id（增加候选数）
+        ranked_docs = sorted(
+            doc_scores.items(),
+            key=lambda x: (x[1]["score"] * 0.6 + x[1]["count"] * 0.4),
+            reverse=True,
+        )[:10]
+        top_doc_ids = {doc_id for doc_id, _ in ranked_docs}
+
+        # 步骤 5：在推断领域内精排 + 全局 BM25 补充
+        refined_hits = search(question, inferred_domain, self.ki, self.ri, self.si, top_k=15)
+
+        # 也搜索第二可能领域
+        if len(domain_votes) > 1:
+            second_domain = sorted(domain_votes.items(), key=lambda x: x[1], reverse=True)[1][0]
+            second_hits = search(question, second_domain, self.ki, self.ri, self.si, top_k=8)
+            refined_hits.extend(second_hits)
+
+        # 合并全局 BM25 结果
+        global_refined = self.ki.search(question, top_k=10)
+        for h in global_refined:
+            if h not in refined_hits:
+                refined_hits.append(h)
+
+        # 优先保留 top_doc_ids 的 chunks
+        primary = [h for h in refined_hits if h.get("doc_id") in top_doc_ids]
+        secondary = [h for h in refined_hits if h.get("doc_id") not in top_doc_ids]
+        result = primary + secondary
+
+        if not result:
+            result = all_candidates[:10]
+
+        logger.info(f"[盲测] 推断领域: {inferred_domain}, 候选文档: {list(top_doc_ids)[:5]}")
+        return result, inferred_domain
 
     # ====================================================================
     #  压缩阶段
@@ -379,6 +529,7 @@ class FinancialAgent:
         self,
         questions: list[dict],
         max_workers: int = MAX_CONCURRENCY,
+        blind: bool = False,
     ) -> list[dict]:
         """
         并发处理多道题目，控制总 Token 消耗。
@@ -386,11 +537,13 @@ class FinancialAgent:
         Args:
             questions: 题目列表
             max_workers: 最大并发数
+            blind: 是否使用盲测模式
 
         Returns:
             结果列表（顺序与输入一致）
         """
         results = [None] * len(questions)
+        solve_fn = self.solve_blind if blind else self.solve
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {}
@@ -408,7 +561,7 @@ class FinancialAgent:
                     }
                     continue
 
-                future = executor.submit(self.solve, q)
+                future = executor.submit(solve_fn, q)
                 future_to_idx[future] = idx
 
             for future in as_completed(future_to_idx):
