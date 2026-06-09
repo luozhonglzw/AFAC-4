@@ -15,6 +15,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -80,6 +81,18 @@ def parse_args():
     parser.add_argument(
         "--limit", type=int, default=0,
         help="只处理前 N 题（0=不限制，用于调试）",
+    )
+    parser.add_argument(
+        "--per-domain", type=int, default=0,
+        help="每个领域采样 N 题（配合 --sample-seed 使用）",
+    )
+    parser.add_argument(
+        "--sample-seed", type=int, default=42,
+        help="随机采样种子（默认 42）",
+    )
+    parser.add_argument(
+        "--blind-test", action="store_true",
+        help="盲测模式：删除 doc_ids，测试候选文档检索能力",
     )
     parser.add_argument(
         "--debug", action="store_true",
@@ -308,6 +321,27 @@ def main():
     if not questions:
         logger.error("没有找到题目，退出")
         sys.exit(1)
+
+    # per-domain 采样
+    if args.per_domain > 0:
+        rng = random.Random(args.sample_seed)
+        by_domain: dict[str, list] = {}
+        for q in questions:
+            by_domain.setdefault(q.get("domain", ""), []).append(q)
+        sampled = []
+        for domain, qs in sorted(by_domain.items()):
+            n = min(args.per_domain, len(qs))
+            picked = rng.sample(qs, n)
+            sampled.extend(picked)
+            logger.info(f"  [{domain}] 采样 {n}/{len(qs)} 题")
+        questions = sampled
+        logger.info(f"  采样后共 {len(questions)} 题")
+
+    # blind-test 模式：删除 doc_ids
+    if args.blind_test:
+        for q in questions:
+            q.pop("doc_ids", None)
+        logger.info("  盲测模式：已删除所有 doc_ids")
 
     # limit 截断
     if limit > 0:

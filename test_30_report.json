@@ -1,0 +1,72 @@
+{
+  "test_name": "30-question per-domain sampling test",
+  "timestamp": "2026-06-09T22:07:59",
+  "config": {
+    "split": "A",
+    "per_domain": 6,
+    "sample_seed": 42,
+    "workers": 4,
+    "debug": true,
+    "budget_limit": 5000000
+  },
+  "summary": {
+    "total_questions": 30,
+    "successful": 20,
+    "failed_timeout": 7,
+    "failed_quota": 3,
+    "total_tokens": 139365,
+    "prompt_tokens": 83095,
+    "completion_tokens": 56270,
+    "budget_used_pct": 2.8,
+    "avg_tokens_per_question": 6968,
+    "token_score": 100.0
+  },
+  "per_domain": {
+    "financial_contracts": {
+      "total": 6, "ok": 5, "timeout": 1,
+      "avg_tokens": 5401, "min_tokens": 4063, "max_tokens": 7755,
+      "questions": ["fc_a_004", "fc_a_001", "fc_a_009", "fc_a_008", "fc_a_017", "fc_a_003"]
+    },
+    "financial_reports": {
+      "total": 6, "ok": 4, "timeout": 2,
+      "avg_tokens": 8068, "min_tokens": 7690, "max_tokens": 8568,
+      "questions": ["fin_a_004", "fin_a_018", "fin_a_003", "fin_a_014", "fin_a_002", "fin_a_001"]
+    },
+    "insurance": {
+      "total": 6, "ok": 4, "timeout": 2,
+      "avg_tokens": 6474, "min_tokens": 4210, "max_tokens": 8217,
+      "questions": ["ins_a_003", "ins_a_007", "ins_a_008", "ins_a_017", "ins_a_001", "ins_a_009"]
+    },
+    "regulatory": {
+      "total": 6, "ok": 4, "timeout": 2,
+      "avg_tokens": 7274, "min_tokens": 6795, "max_tokens": 7706,
+      "questions": ["reg_a_007", "reg_a_018", "reg_a_014", "reg_a_008", "reg_a_015", "reg_a_010"]
+    },
+    "research": {
+      "total": 6, "ok": 3, "timeout": 3,
+      "avg_tokens": 8365, "min_tokens": 8059, "max_tokens": 8780,
+      "questions": ["res_a_009", "res_a_001", "res_a_006", "res_a_014", "res_a_011", "res_a_005"]
+    }
+  },
+  "per_question_type": {
+    "mcq": {"count": 0, "note": "need answer_format data from questions"},
+    "multi": {"count": 0},
+    "tf": {"count": 0}
+  },
+  "answer_distribution": {
+    "A": 6, "AC": 3, "C": 4, "B": 3, "ABC": 1, "ABCDE": 1, "ABCD": 1, "empty": 10
+  },
+  "anomalies": [
+    "7 questions timed out (API read timeout after 60s)",
+    "3 questions failed with 403 (free tier quota exhausted near end)",
+    "fin_a_001 returned ABCDE (all options selected - possible error)",
+    "ins_a_017 returned ABCD (4 of 5 options - verify correctness)"
+  ],
+  "optimization_recommendations": [
+    "Increase REQUEST_TIMEOUT from 60s to 120s for large context questions",
+    "Add retry with different temperature on timeout",
+    "Research domain has highest avg tokens (8365) - consider more aggressive compression",
+    "financial_reports domain also high (8068) - table-heavy content needs special handling",
+    "Multi-select questions (ABCDE) need validation - max 4 options for most questions"
+  ]
+}
