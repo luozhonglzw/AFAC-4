@@ -1,0 +1,17 @@
+# AFAC2026-4 金融文档智能问答系统
+# Python 3.10+
+
+# PDF 解析
+pdfplumber>=0.10.0
+PyMuPDF>=1.23.0
+
+# LLM API
+openai>=1.0.0
+
+# 数据处理
+numpy>=1.24.0
+pandas>=2.0.0
+
+# 工具库
+tqdm>=4.65.0
+python-dotenv>=1.0.0
