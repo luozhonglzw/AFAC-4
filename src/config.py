@@ -3,6 +3,10 @@
 """
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# 自动加载项目根目录的 .env 文件
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 # ==================== 路径配置 ====================
 PROJECT_ROOT = Path(__file__).parent.parent
