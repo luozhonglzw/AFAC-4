@@ -235,25 +235,33 @@ def step_load_questions(split: str, domain_filter: str = None) -> list[dict]:
 
 # ==================== 步骤 4：批量解题 ====================
 
-# 断点续跑：checkpoint 文件路径
-CHECKPOINT_FILE = PROJECT_ROOT / "output" / "checkpoint.json"
+# 断点续跑：checkpoint 文件路径（默认，可被 output_dir 覆盖）
+_DEFAULT_CHECKPOINT = PROJECT_ROOT / "output" / "checkpoint.json"
 
-def _load_checkpoint() -> set[str]:
+def _get_checkpoint_file(output_dir: Path = None) -> Path:
+    if output_dir:
+        return output_dir / "checkpoint.json"
+    return _DEFAULT_CHECKPOINT
+
+def _load_checkpoint(checkpoint_file: Path) -> set[str]:
     """加载已完成的 qid 集合"""
-    if CHECKPOINT_FILE.exists():
+    if checkpoint_file.exists():
         try:
-            with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+            with open(checkpoint_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return set(data.get("completed_qids", []))
         except Exception:
             pass
     return set()
 
-def _save_checkpoint(completed_qids: set[str]):
-    """保存已完成的 qid 集合"""
-    CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
-        json.dump({"completed_qids": sorted(completed_qids)}, f, ensure_ascii=False, indent=2)
+def _save_checkpoint(completed_qids: set[str], total_tokens: int, checkpoint_file: Path):
+    """保存已完成的 qid 集合和 token 统计"""
+    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(checkpoint_file, "w", encoding="utf-8") as f:
+        json.dump({
+            "completed_qids": sorted(completed_qids),
+            "total_tokens": total_tokens,
+        }, f, ensure_ascii=False, indent=2)
 
 def _check_budget_warning(agent: FinancialAgent, question_idx: int, total_questions: int):
     """检查预算状态并输出警告"""
@@ -287,8 +295,12 @@ def step_solve(
     budget_limit: int,
     debug: bool = False,
     resume: bool = False,
+    checkpoint_file: Path = None,
 ) -> list[dict]:
     """批量解题，支持断点续跑和预算预警"""
+    if checkpoint_file is None:
+        checkpoint_file = _DEFAULT_CHECKPOINT
+
     logger.info("=" * 50)
     logger.info(f"步骤 4：批量解题（{max_workers} 并发，预算 {budget_limit:,}）")
     logger.info("=" * 50)
@@ -298,7 +310,7 @@ def step_solve(
     # 断点续跑：跳过已完成的题目
     completed_qids = set()
     if resume:
-        completed_qids = _load_checkpoint()
+        completed_qids = _load_checkpoint(checkpoint_file)
         if completed_qids:
             logger.info(f"断点续跑：跳过 {len(completed_qids)} 个已完成题目")
 
@@ -354,7 +366,7 @@ def step_solve(
 
             # 保存断点
             completed_qids.add(qid)
-            _save_checkpoint(completed_qids)
+            _save_checkpoint(completed_qids, agent.token_usage["total"], checkpoint_file)
 
             # 请求间隔（减少限流）
             if i < len(questions) - 1:
@@ -369,7 +381,7 @@ def step_solve(
         for r in results:
             if r and r.get("qid"):
                 completed_qids.add(r["qid"])
-        _save_checkpoint(completed_qids)
+        _save_checkpoint(completed_qids, agent.token_usage["total"], checkpoint_file)
 
     stats = agent.get_stats()
     logger.info(f"解题完成: {len(results)} 题")
@@ -448,7 +460,9 @@ def main():
         logger.info(f"  截断为前 {limit} 题")
 
     # 步骤 4：批量解题
-    results = step_solve(questions, ki, ri, si, max_workers, budget_limit, debug=debug, resume=args.resume)
+    checkpoint_file = _get_checkpoint_file(output_dir)
+    results = step_solve(questions, ki, ri, si, max_workers, budget_limit,
+                         debug=debug, resume=args.resume, checkpoint_file=checkpoint_file)
 
     # 步骤 5：生成提交文件
     logger.info("=" * 50)

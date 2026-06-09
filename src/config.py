@@ -30,7 +30,7 @@ if not API_KEY:
     )
 
 # ==================== 模型配置 ====================
-QWEN_MODEL = "qwen3.6-plus"
+QWEN_MODEL = "qwen-plus"  # 备选: "qwen-plus-2025-07-28"
 
 # 百炼（优先）/ 魔搭 双 endpoint
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
